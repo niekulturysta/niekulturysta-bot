@@ -1,0 +1,19 @@
+# Plik .gitignore dla bota Telegram
+# Ukryj dane wrażliwe
+.env
+
+# Python cache
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+*.sqlite3
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# System files
+.DS_Store
+Thumbs.db
