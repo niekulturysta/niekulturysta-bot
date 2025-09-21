@@ -1,8 +1,10 @@
 # bot/retrieval.py
 from typing import List, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, select, or_
+from sqlalchemy.exc import SQLAlchemyError
 from db import Doc
+from sqlalchemy import text, select, or_, cast, String
+
 
 # ——— stoplist PL ———
 POLISH_STOP = {
@@ -79,98 +81,64 @@ async def search_snippets(session: AsyncSession, query: str, k: int = 8) -> List
     docs = (await session.execute(select(Doc).limit(3))).scalars().all()
     return [(d.title, (d.content or "")[:800]) for d in docs]
 
-# ——— wyszukiwanie po rodzaju + meta ———
-async def search_by_kind(session: AsyncSession, query: str, kind: str, k: int = 5):
-    terms = _keywords(query)
-    fts_q = _fts_query_or_prefix(terms) or query
-
-    # FTS5 z filtrem kind
-    try:
-        sql = text("""
-            SELECT d.id, d.title
-            FROM docs_fts
-            JOIN docs d ON d.id = docs_fts.rowid
-            WHERE docs_fts MATCH :q
-              AND d.kind = :kind
-            ORDER BY bm25(docs_fts) ASC
-            LIMIT :k
-        """)
-        rows = (await session.execute(sql, {"q": fts_q, "kind": kind, "k": k})).all()
-        if rows:
-            ids = [r[0] for r in rows]
-            docs = (await session.execute(select(Doc).where(Doc.id.in_(ids)))).scalars().all()
-            id2doc = {d.id: d for d in docs}
-            out = []
-            for rid, title in rows:
-                d = id2doc.get(rid)
-                content = (d.content or "")[:800] if d else ""
-                meta = d.meta or {}
-                out.append((title, content, meta))
-            return out
-    except Exception:
-        pass
-
-    # Fallback: LIKE
-    likes = [Doc.content.ilike(f"%{t}%") for t in terms] if terms else []
-    if likes:
-        docs = (await session.execute(
-            select(Doc).where(Doc.kind == kind, or_(*likes)).limit(k)
-        )).scalars().all()
-    else:
-        docs = (await session.execute(
-            select(Doc).where(Doc.kind == kind).limit(k)
-        )).scalars().all()
-
-    return [(d.title, (d.content or "")[:800], (d.meta or {})) for d in docs]
-
-# ——— wyszukiwanie po rodzaju + filtr meta.topic ———
-async def search_by_kind_topic(session: AsyncSession, query: str, kind: str, topic: str, k: int = 3):
+async def search_by_kind(session: AsyncSession, bias, kind: str, k: int = 3):
     """
-    FTS5 + filtr meta.topic:
-      - d.kind == kind (ebook/note/study/recipe)
-      - json_extract(d.meta, '$.topic') == topic  (np. 'Trening', 'Redukcja', 'Masa', 'Motywacja')
-    Jeśli nic nie znajdzie → LIKE po meta → fallback do search_by_kind().
+    Prosty LIKE pod Postgresa: szuka w treści dokumentów o danym kind
+    według słów kluczowych z 'bias' (lista/str). Zwraca (title, snippet, meta).
     """
-    terms = _keywords(query)
-    fts_q = _fts_query_or_prefix(terms) or query
-
-    # 1) FTS5 + meta.topic
     try:
-        sql = text("""
-            SELECT d.id, d.title
-            FROM docs_fts
-            JOIN docs d ON d.id = docs_fts.rowid
-            WHERE docs_fts MATCH :q
-              AND d.kind = :kind
-              AND json_extract(d.meta, '$.topic') = :topic
-            ORDER BY bm25(docs_fts) ASC
-            LIMIT :k
-        """)
-        rows = (await session.execute(sql, {"q": fts_q, "kind": kind, "topic": topic, "k": k})).all()
-        if rows:
-            ids = [r[0] for r in rows]
-            docs = (await session.execute(select(Doc).where(Doc.id.in_(ids)))).scalars().all()
-            id2 = {d.id: d for d in docs}
-            out = []
-            for rid, title in rows:
-                d = id2.get(rid)
-                content = (d.content or "")[:800] if d else ""
-                meta = d.meta or {}
-                out.append((title, content, meta))
-            return out
-    except Exception:
-        pass
+        terms = []
+        if isinstance(bias, list):
+            terms = [w for w in bias[:6] if w]
+        elif isinstance(bias, str) and bias.strip():
+            terms = [bias.strip()]
 
-    # 2) Fallback: LIKE po meta.topic
+        filters = [Doc.content.ilike(f"%{w}%") for w in terms]
+        stmt = (
+            select(Doc)
+            .where(
+                Doc.kind == kind,
+                or_(*filters) if filters else True  # gdy brak słów – nie filtruj treści
+            )
+            .limit(k)
+        )
+        res = await session.execute(stmt)
+        rows = res.scalars().all()
+        return [(d.title, (d.content or "")[:800], (d.meta or {})) for d in rows]
+    except SQLAlchemyError:
+        await session.rollback()
+        return []
+
+async def search_by_kind_topic(session: AsyncSession, bias, kind: str, topic: str, k: int = 3):
+    """
+    Wersja 'topic' pod Postgresa: filtruje po kind oraz po meta.topic (JSON),
+    ale przez prosty LIKE na zcastowanym do tekstu JSON-ie.
+    """
     try:
         like_topic = f'%\"topic\": \"{topic}\"%'
-        docs = (await session.execute(
-            select(Doc).where(Doc.kind == kind, Doc.meta.ilike(like_topic)).limit(k)
-        )).scalars().all()
-        if docs:
-            return [(d.title, (d.content or "")[:800], (d.meta or {})) for d in docs]
-    except Exception:
-        pass
+        terms = []
+        if isinstance(bias, list):
+            terms = [w for w in bias[:6] if w]
+        elif isinstance(bias, str) and bias.strip():
+            terms = [bias.strip()]
+        content_filters = [Doc.content.ilike(f"%{w}%") for w in terms]
 
-    # 3) Ostatecznie: zwykłe wyszukiwanie po kind
-    return await search_by_kind(session, query, kind, k=k)
+        stmt = (
+            select(Doc)
+            .where(
+                Doc.kind == kind,
+                cast(Doc.meta, String).ilike(like_topic),
+                or_(*content_filters) if content_filters else True
+            )
+            .limit(k)
+        )
+        res = await session.execute(stmt)
+        rows = res.scalars().all()
+        if rows:
+            return [(d.title, (d.content or "")[:800], (d.meta or {})) for d in rows]
+    except SQLAlchemyError:
+        await session.rollback()
+
+    # fallback: bez topic
+    return await search_by_kind(session, bias, kind, k=k)
+
