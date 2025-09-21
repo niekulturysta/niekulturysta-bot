@@ -2,8 +2,9 @@ from typing import Optional, List
 from datetime import datetime
 
 from sqlalchemy import (
-    Integer, String, Text, ForeignKey, DateTime, Boolean, Float, func, JSON, text
-)
+    Integer, String, Text, ForeignKey, DateTime, Boolean, Float, func, JSON, text,
+    BigInteger,)
+
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 
@@ -23,7 +24,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tg_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
     username: Mapped[Optional[str]] = mapped_column(String(64))
     first_name: Mapped[Optional[str]] = mapped_column(String(64))
     last_name: Mapped[Optional[str]] = mapped_column(String(64))
@@ -55,7 +56,7 @@ class Reminder(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    chat_id: Mapped[int] = mapped_column(index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     text: Mapped[str] = mapped_column(Text)
     cron: Mapped[Optional[str]] = mapped_column(String(64))  # e.g. "0 9 * * *"
     next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
